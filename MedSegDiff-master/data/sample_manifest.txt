@@ -1,0 +1,12 @@
+seed=42
+model=/home/zhaojianxiang/dosediff-zjx/MedSegDiff-master/scripts/trained_models/MedSegDiff_Flow_3D_bs3_epoch600/model_epoch200.pth
+_2451754
+_00493913
+_00379891
+_2470495
+_00509995
+_00506913
+_00505171
+_00498622
+_2469299
+_00491278
