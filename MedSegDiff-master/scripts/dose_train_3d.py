@@ -17,7 +17,15 @@ from tqdm import tqdm
 
 from guided_diffusion.dose_loader_3d import Dataset_PSDM_3D_Train
 from guided_diffusion.unet_3d import UNetModel_MS_Former_3D
+from guided_diffusion.unet_3d_v1_1 import UNetModel_GatedXQueryViT_3D
 from flow_matching import FlowMatching
+
+
+# Model registry: model_name -> class
+MODEL_REGISTRY = {
+    'v1': UNetModel_MS_Former_3D,                       # baseline: addition fusion + Q=CT,K=DIS,V=X ViT
+    'v1_1_gated_xquery_vit': UNetModel_GatedXQueryViT_3D,  # gated fusion + Q=X,K/V=condition ViT
+}
 
 
 # ----------------------------- CLI ARGS -----------------------------
@@ -39,6 +47,9 @@ parser.add_argument("--grad_clip", type=float, default=1.0, help="gradient norm 
 # Model
 parser.add_argument("--patch_size", type=int, nargs=3, default=[64, 128, 128], help="patch size (D H W), must be multiples of 16")
 parser.add_argument("--model_channels", type=int, default=64, help="base channel count of UNet (must be multiple of 32 for GroupNorm)")
+parser.add_argument("--model_name", type=str, default="v1", choices=list(MODEL_REGISTRY.keys()),
+                    help="which velocity-field network to use. v1=baseline (UNetModel_MS_Former_3D), "
+                         "v1_1_gated_xquery_vit=gated encoder + X-query ViT (UNetModel_GatedXQueryViT_3D)")
 
 # Data paths
 parser.add_argument("--data_root_train", type=str,
@@ -166,7 +177,12 @@ save_name = 'MedSegDiff_Flow_3D_OpenKBP_11ch_mc{}_bs{}_epoch{}'.format(
 )
 if args.save_name_suffix:
     save_name = save_name + '_' + args.save_name_suffix
-save_dir = os.path.join('trained_models', save_name)
+# v1 keeps the legacy flat layout (backwards compatible);
+# other model variants are namespaced under their model_name to avoid overlap.
+if args.model_name == 'v1':
+    save_dir = os.path.join('trained_models', save_name)
+else:
+    save_dir = os.path.join('trained_models', args.model_name, save_name)
 if is_main:
     os.makedirs(save_dir, exist_ok=True)
 
@@ -200,7 +216,11 @@ if is_main:
 
 # ----------------------------- MODEL -----------------------------
 dis_channels = 11  # 11 OpenKBP masks
-model = UNetModel_MS_Former_3D(
+ModelClass = MODEL_REGISTRY[args.model_name]
+if is_main:
+    print(f"[Model] using model_name='{args.model_name}' -> {ModelClass.__name__}", flush=True)
+
+model = ModelClass(
     image_size=patch_size,
     in_channels=1,
     ct_channels=1,

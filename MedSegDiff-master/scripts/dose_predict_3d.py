@@ -14,7 +14,15 @@ from tqdm import tqdm
 # 导入模型和数据加载器
 from guided_diffusion.dose_loader_3d import Dataset_PSDM_3D_Train, OPENKBP_MASK_NAMES
 from guided_diffusion.unet_3d import UNetModel_MS_Former_3D
+from guided_diffusion.unet_3d_v1_1 import UNetModel_GatedXQueryViT_3D
 from flow_matching import FlowMatching
+
+
+# Model registry: must match scripts/dose_train_3d.py
+MODEL_REGISTRY = {
+    'v1': UNetModel_MS_Former_3D,
+    'v1_1_gated_xquery_vit': UNetModel_GatedXQueryViT_3D,
+}
 
 def denormalize_dose(dose, dose_max=80.0, dose_norm_factor=40.0):
     """反归一化剂量值：从归一化范围 (-1 到 1) 转回原始单位 (0 到 dose_max Gy)"""
@@ -160,6 +168,9 @@ def main():
     parser.add_argument('--gpu', type=int, default=0, help='使用的GPU编号，默认: 0')
     parser.add_argument('--model_channels', type=int, default=64,
                         help='UNet 基础通道数，必须与训练时一致（默认 64）')
+    parser.add_argument('--model_name', type=str, default='v1',
+                        choices=list(MODEL_REGISTRY.keys()),
+                        help='velocity-field network variant. v1=baseline, v1_1_gated_xquery_vit=v1.1 gated+X-query ViT')
 
     args = parser.parse_args()
     
@@ -183,7 +194,10 @@ def main():
     if args.model_channels % 32 != 0:
         raise ValueError(f"--model_channels 必须为 32 的倍数 (GroupNorm32), 当前: {args.model_channels}")
 
-    model = UNetModel_MS_Former_3D(
+    ModelClass = MODEL_REGISTRY[args.model_name]
+    print(f"[Model] using model_name='{args.model_name}' -> {ModelClass.__name__}")
+
+    model = ModelClass(
         image_size=patch_size,
         in_channels=1,
         ct_channels=1,
