@@ -138,14 +138,22 @@ class ViT_fusion_3D(nn.Module):
                                       p1=self.patch_depth, p2=self.patch_height, p3=self.patch_width)
 
     def forward(self, x_q, x_k, x_v):
-        # x_q: CT features
-        # x_k: Dis features
-        # x_v: Main features
+        # Legacy 3-input: x_q=CT, x_k=DIS, x_v=Main (for backwards compatibility)
+        return self.forward_4(x_q, x_k, x_k, x_v)
+
+    def forward_4(self, x_ct, x_syn, x_dis, x_main):
+        # x_ct: CT features
+        # x_syn: Synthetic dose features
+        # x_dis: DIS features
+        # x_main: Main features
+        
+        # Fuse conditions: CT + SYN + DIS -> merged condition
+        x_k = x_ct + x_syn + x_dis
         
         # Patch Embed
-        q = self.to_patch_embedding_q(x_q)
+        q = self.to_patch_embedding_q(x_ct)
         k = self.to_patch_embedding_k(x_k)
-        v = self.to_patch_embedding_v(x_v)
+        v = self.to_patch_embedding_v(x_main)
         
         # Add Positional Embedding
         q += self.pos_embedding

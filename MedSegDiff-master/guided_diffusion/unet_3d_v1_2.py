@@ -1,28 +1,26 @@
 """
-v1.1 — Conditional 3D UNet velocity-field network with two structural upgrades.
+v1.2 — Conditional 3D UNet velocity-field network, extending v1.1 with
+full 4-stream condition handling in the encoder and ViT bottleneck.
 
-Inherits the v1 backbone (3 parallel encoders X / CT / DIS + UNet decoder) but:
+Changes vs ``unet_3d_v1_1.py`` (UNetModel_GatedXQueryViT_3D):
 
-1. Encoder fusion: simple addition  ->  gated fusion
-       h_x    = input_blocks[i](h, emb)
-       h_ct   = input_blocks_CT[i](h_ct, emb)
-       h_dis  = input_blocks_DIS[i](h_dis, emb)
-       h_cond = cond_proj[i]( cat([h_ct, h_dis], 1) )           # 2C -> C  (1x1x1 conv)
-       gate   = sigmoid( gate_proj[i]( cat([h_x, h_cond], 1) ) )# 2C -> C  (1x1x1 conv)
-       h      = h_x + gate * h_cond
-       hs.append(h)                                             # skip uses fused h
+1. Encoder: properly track ALL FOUR streams (X / CT / SYN / DIS) instead
+   of only X / CT / DIS.  The ``last_h_syn`` feature is now captured
+   for use in the ViT bottleneck.
 
-2. Bottleneck ViT: ViT_fusion_3D(Q=CT, K=DIS, V=X)  ->  ViT_fusion_3D_XQuery(x_feat, cond_feat)
-       cond_feat = vit_cond_proj( cat([last_h_ct, last_h_dis], 1) )
-       vit_out   = fusion(last_h_x, cond_feat)
-       h         = last_h_x + vit_out      # bottleneck input to middle_block
+2. Bottleneck ViT: uses ``ViT_fusion_3D_XQuery_v1_2`` which calls
+   ``forward_4(ct_feat, syn_feat, dis_feat, main_feat)`` so that the
+   synthetic dose has its own dedicated patch embedding and contributes
+   to the cross-attention key/value alongside CT and DIS.
 
-The decoder (incl. skip-concat path), middle_block and output projection are unchanged.
-``model(x, t, ct, dis) -> v`` forward signature is preserved.
+3. The ``cond_proj`` and ``gate_proj`` logic (gated residual control)
+   is unchanged — they still fuse CT + SYN + DIS -> C then modulate X.
 
-All other building blocks are reused unchanged from ``unet_3d.py``:
-``TimestepBlock``, ``TimestepEmbedSequential``, ``Upsample``, ``Downsample``,
-``ResBlock``, ``AttentionBlock``.
+4. Forward signature and all I/O shapes are preserved.
+
+The only semantic difference is that the synthetic dose now gets
+explicit per-token representation inside the bottleneck ViT, rather
+than being flattened into the condition projection before the ViT.
 """
 import torch as th
 import torch.nn as nn
@@ -35,7 +33,6 @@ from .nn import (
     timestep_embedding,
     checkpoint,
 )
-
 from .unet_3d import (
     TimestepEmbedSequential,
     Upsample,
@@ -43,22 +40,24 @@ from .unet_3d import (
     ResBlock,
     AttentionBlock,
 )
+from .vit_v1_2 import ViT_fusion_3D_XQuery_v1_2
 
-from .vit_v1_1 import ViT_fusion_3D_XQuery
 
+class UNetModel_GatedXQueryViT_3D_v1_2(nn.Module):
+    """v1.2 velocity-field network.
 
-class UNetModel_GatedXQueryViT_3D(nn.Module):
-    """v1.1 velocity-field network.
+    Inherits the v1.1 backbone and gated fusion, but:
+      - Tracks ``last_h_syn`` separately in the 4-stream encoder.
+      - Uses ``ViT_fusion_3D_XQuery_v1_2`` so the bottleneck ViT
+        sees explicit CT / SYN / DIS / Main features.
 
-    Args mirror ``UNetModel_MS_Former_3D`` so existing training/inference code can swap by name.
+    Args mirror ``UNetModel_GatedXQueryViT_3D`` so existing training /
+    inference code can swap by name.
 
     Additional behaviour:
-        - One ``cond_proj`` (1x1x1 Conv3D) per encoder block, with input 2C and output C
-          where C = output channels of that block (same across X/CT/DIS streams).
-        - One ``gate_proj`` (1x1x1 Conv3D) per encoder block; bias initialised to -2.0 so the
-          initial gate is sigmoid(-2) ~ 0.12 (gentle condition injection at the start of training).
-        - One bottleneck ``vit_cond_proj`` (1x1x1 Conv3D) that projects cat([h_ct, h_dis], 1)
-          (2C) to C channels before feeding cond_feat to the X-query ViT.
+        - ``last_h_syn`` is now captured for ViT bottleneck (v1.1 only
+          tracked CT, DIS).
+        - Bottleneck ViT is ``ViT_fusion_3D_XQuery_v1_2`` (calls forward_4).
     """
 
     def __init__(
@@ -85,7 +84,7 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
-        # v1.1 specific
+        # v1.1 / v1.2 shared ViT params
         vit_dim=1024,
         vit_heads=4,
         vit_mlp_dim=2048,
@@ -124,7 +123,7 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
 
         ch = input_ch = int(channel_mult[0] * model_channels)
 
-        # ----- Three-stream input blocks (same topology as v1) -----
+        # ----- Four-stream input blocks (X / CT / SYN / DIS) -----
         self.input_blocks = nn.ModuleList([
             TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))
         ])
@@ -138,7 +137,7 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
             TimestepEmbedSequential(conv_nd(dims, dis_channels, ch, 3, padding=1))
         ])
 
-        input_block_chans = [ch]  # tracks output ch of each input_blocks[i]
+        input_block_chans = [ch]
         ds = 1
 
         for level, mult in enumerate(channel_mult):
@@ -198,7 +197,7 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
                 input_block_chans.append(ch)
                 ds *= 2
 
-        # ----- v1.1: per-block gated condition fusion -----
+        # ----- Per-block gated condition fusion (unchanged from v1.1) -----
         # cond_proj[i]: cat(h_ct, h_syn, h_dis) (3C) -> h_cond (C)
         # gate_proj[i]: cat(h_x, h_cond) (2C) -> gate logits (C). bias init -> gate_init_bias.
         self.cond_proj = nn.ModuleList()
@@ -207,12 +206,11 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
             cp = conv_nd(dims, 3 * c, c, 1)
             self.cond_proj.append(cp)
             gp = conv_nd(dims, 2 * c, c, 1)
-            # Zero-init weights so initial output is exactly the bias, then bias = -2.0.
             nn.init.zeros_(gp.weight)
             nn.init.constant_(gp.bias, gate_init_bias)
             self.gate_proj.append(gp)
 
-        # ----- Bottleneck cond projection + X-query ViT -----
+        # ----- Bottleneck: ViT with 4-condition input -----
         ds_factor = 2 ** (len(channel_mult) - 1)
         if isinstance(image_size, int):
             feature_size = (image_size // ds_factor, image_size // ds_factor, image_size // ds_factor)
@@ -222,7 +220,8 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
         # Project cat([last_h_ct, last_h_syn, last_h_dis], 1) (3*ch) -> ch
         self.vit_cond_proj = conv_nd(dims, 3 * ch, ch, 1)
 
-        self.fusion = ViT_fusion_3D_XQuery(
+        # v1.2: use ViT_fusion_3D_XQuery_v1_2 which exposes forward_4
+        self.fusion = ViT_fusion_3D_XQuery_v1_2(
             image_size=feature_size,
             patch_size=vit_patch_size,
             dim=vit_dim,
@@ -271,18 +270,19 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
         )
 
     def _vit_bottleneck(self, last_h_x, last_h_ct, last_h_syn, last_h_dis):
-        """X-query ViT at bottleneck (checkpoint-friendly)."""
+        """v1.2 bottleneck: call ViT forward_4 with explicit SYN tensor."""
         cond_feat = self.vit_cond_proj(th.cat([last_h_ct, last_h_syn, last_h_dis], dim=1))
-        return last_h_x + self.fusion(last_h_x, cond_feat)
+        # forward_4: CT as Q, CT+SYN+DIS as K, Main as V
+        return last_h_x + self.fusion.forward_4(last_h_ct, last_h_syn, last_h_dis, last_h_x)
 
     def forward(self, x, timesteps, ct, syn, dis, y=None):
-        """v1.1 forward.
+        """v1.2 forward.
 
         Args:
             x        : (B, in_channels,  D, H, W)  — noisy dose x_t.
             timesteps: (B,)                         — Flow Matching time (already scaled to [0, 1000]).
             ct       : (B, ct_channels,  D, H, W)
-            syn      : (B, syn_channels, D, H, W)
+            syn      : (B, syn_channels, D, H, W)  ← NEW in v1.2
             dis      : (B, dis_channels, D, H, W)
 
         Returns:
@@ -326,14 +326,14 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
                 fuse_params,
                 self.use_checkpoint,
             )
-            hs.append(h)  # skip connection uses the gated fused feature
+            hs.append(h)
 
             last_h_x = h_x
             last_h_ct = h_ct
-            last_h_syn = h_syn
+            last_h_syn = h_syn   # v1.2: now tracked separately
             last_h_dis = h_dis
 
-        # ----- X-query ViT cross-attention at bottleneck -----
+        # ----- X-query ViT cross-attention at bottleneck (4-condition) -----
         vit_params = (
             list(self.vit_cond_proj.parameters()) + list(self.fusion.parameters())
         )

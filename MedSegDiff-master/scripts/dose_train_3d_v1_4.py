@@ -1,3 +1,43 @@
+#!/usr/bin/env python3
+"""
+dose_train_3d_v1_4.py
+=====================
+v1.4 (ControlNet-lite Penalty Adapter) training script.
+
+The dose generation backbone is the v1.2 4-stream UNet with X-query
+ViT bottleneck. The new v1.4 components are:
+
+  * A lightweight 3D ``PenaltyAdapter3D`` consuming a 3D penalty field
+    (1 channel fused, or N channels for [S_target, A_oar, B_boundary,
+    P_fused]).
+
+  * Zero-initialised 1x1x1 Conv3D ``zero-conv`` injectors that add the
+    adapter's multi-scale features into the main encoder's X stream
+    (and the bottleneck), so the model at init is functionally
+    identical to v1.2.
+
+Resume from a v1.2 checkpoint with ``--resume_from`` (loaded with
+``strict=False``); the adapter and zero-convs are trained from
+scratch. ``--adapter_warmup_epochs`` optionally freezes the v1.2
+backbone for the first N epochs so only the new branch is updated.
+
+Usage examples:
+
+    # Train v1.4 from scratch (rare)
+    torchrun --nproc_per_node=2 scripts/dose_train_3d_v1_4.py \\
+        --epoch 600 --val_every 50
+
+    # Continue from a v1.2 checkpoint, no adapter warm-up
+    torchrun --nproc_per_node=2 scripts/dose_train_3d_v1_4.py \\
+        --resume_from trained_models/v1_2_gated_xquery_vit/.../model_best_mae.pth \\
+        --resume_ema  trained_models/v1_2_gated_xquery_vit/.../ema_best_mae.pth \\
+        --epoch 400 --val_every 25
+
+    # Continue from v1.2, but freeze backbone for the first 20 epochs
+    torchrun --nproc_per_node=2 scripts/dose_train_3d_v1_4.py \\
+        --resume_from .../model_best_mae.pth \\
+        --epoch 400 --adapter_warmup_epochs 20
+"""
 import sys
 sys.path.append("../")
 sys.path.append("./")
@@ -6,6 +46,7 @@ import os
 import argparse
 import contextlib
 import re
+
 import torch
 import numpy as np
 import torch.distributed as dist
@@ -16,87 +57,80 @@ from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 from tqdm import tqdm
 
-from guided_diffusion.dose_loader_3d import Dataset_PSDM_3D_Train
-from guided_diffusion.unet_3d import UNetModel_MS_Former_3D
-from guided_diffusion.unet_3d_v1_1 import UNetModel_GatedXQueryViT_3D
-from guided_diffusion.unet_3d_v1_2 import UNetModel_GatedXQueryViT_3D_v1_2
-from guided_diffusion.unet_3d_v1_3 import UNetModel_GatedXQueryViT_3D_v1_3
-from guided_diffusion.unet_3d_v2 import UNetModel_ControlSwinFlow_3D
-from flow_matching import FlowMatching, FlowMatchingV13
-
-
-# Model registry: model_name -> class
-MODEL_REGISTRY = {
-    'v1': UNetModel_MS_Former_3D,                       # baseline: addition fusion + Q=CT,K=DIS,V=X ViT
-    'v1_1_gated_xquery_vit': UNetModel_GatedXQueryViT_3D,  # gated fusion + Q=X,K/V=condition ViT
-    'v1_2_gated_xquery_vit': UNetModel_GatedXQueryViT_3D_v1_2,  # v1.1 + explicit SYN tracking in 4-stream encoder + forward_4 ViT bottleneck
-    'v1_3_gated_xquery_vit': UNetModel_GatedXQueryViT_3D_v1_3,  # v1.2 + DROPS DIS; 3-condition (CT / SYN / t) + 3-stream encoder + forward_3 ViT bottleneck
-    'v2_control_swin_flow_unet': UNetModel_ControlSwinFlow_3D,  # 2-stream + multi-scale gated control + 32^3/16^3 window cross-attn
-}
+from guided_diffusion.dose_loader_3d_v1_4 import (
+    Dataset_PSDM_3D_Train_v1_4,
+    DEFAULT_MULTI_PENALTY_FILES,
+)
+from guided_diffusion.unet_3d_v1_4 import UNetModel_PenaltyAdapter_v1_4
+from flow_matching import FlowMatchingV14
 
 
 # ----------------------------- CLI ARGS -----------------------------
-parser = argparse.ArgumentParser()
-parser.add_argument('--gpu', type=str, default="0", help='which gpu is used (informational, controlled by CUDA_VISIBLE_DEVICES)')
-parser.add_argument('--bs', type=int, default=1, help='batch size per gpu')
-parser.add_argument('--epoch', type=int, default=600, help='total epochs')
+parser = argparse.ArgumentParser(description="Train v1.4 (v1.2 + ControlNet-lite penalty adapter).")
+parser.add_argument('--gpu', type=str, default="0")
+parser.add_argument('--bs', type=int, default=1)
+parser.add_argument('--epoch', type=int, default=600)
 parser.add_argument("--local_rank", default=-1, type=int)
-parser.add_argument("--steps", type=int, default=50, help='legacy arg, sampling steps (use --val_steps instead)')
 
 # Training schedule
-parser.add_argument("--grad_accum_steps", type=int, default=4, help="gradient accumulation steps (effective batch = world_size * bs * grad_accum_steps)")
-parser.add_argument("--warmup_ratio", type=float, default=0.05, help="warmup ratio for total epochs")
-parser.add_argument("--lr_max", type=float, default=1e-4, help="peak learning rate after warmup")
-parser.add_argument("--min_lr", type=float, default=1e-6, help="minimum lr for cosine annealing")
-parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay")
-parser.add_argument("--grad_clip", type=float, default=1.0, help="gradient norm clip")
+parser.add_argument("--grad_accum_steps", type=int, default=4)
+parser.add_argument("--warmup_ratio", type=float, default=0.05)
+parser.add_argument("--lr_max", type=float, default=1e-4)
+parser.add_argument("--min_lr", type=float, default=1e-6)
+parser.add_argument("--weight_decay", type=float, default=1e-4)
+parser.add_argument("--grad_clip", type=float, default=1.0)
 
-# Model
-parser.add_argument("--patch_size", type=int, nargs=3, default=[64, 128, 128], help="patch size (D H W), must be multiples of 16")
-parser.add_argument("--model_channels", type=int, default=32, help="base channel count of UNet (must be multiple of 32 for GroupNorm)")
-parser.add_argument("--model_name", type=str, default="v1", choices=list(MODEL_REGISTRY.keys()),
-                    help="which velocity-field network to use. v1=baseline (UNetModel_MS_Former_3D), "
-                         "v1_1_gated_xquery_vit=gated encoder + X-query ViT (UNetModel_GatedXQueryViT_3D), "
-                         "v1_2_gated_xquery_vit=v1.1 + explicit SYN tracking + forward_4 ViT bottleneck, "
-                         "v1_3_gated_xquery_vit=v1.2 DROP DIS + 3-condition (CT/SYN/t) + forward_3 ViT bottleneck")
+# Main UNet
+parser.add_argument("--patch_size", type=int, nargs=3, default=[128, 128, 128])
+parser.add_argument("--model_channels", type=int, default=32)
+parser.add_argument("--channel_mult", type=int, nargs='+', default=[1, 2, 4, 4])
+
+# v1.4 penalty branch
+parser.add_argument("--penalty_mode", type=str, choices=['single', 'multi'], default='single',
+                    help="'single' -> one penalty.nii.gz (P=1); 'multi' -> 4 files (P=4)")
+parser.add_argument("--penalty_files", type=str, nargs='*', default=None,
+                    help="override default penalty filename(s); space-separated")
+parser.add_argument("--penalty_channels", type=int, default=None,
+                    help="explicit penalty channel count; if None, inferred from --penalty_mode")
+parser.add_argument("--penalty_model_channels", type=int, default=None,
+                    help="adapter base channels; defaults to --model_channels")
+parser.add_argument("--penalty_num_res_blocks", type=int, default=1)
+parser.add_argument("--penalty_dropout_p", type=float, default=0.2,
+                    help="per-sample probability of zeroing penalty input at training time")
+parser.add_argument("--disable_penalty_dropout", action='store_true')
+parser.add_argument("--adapter_warmup_epochs", type=int, default=0,
+                    help="for the first N epochs, freeze the v1.2 backbone (only train adapter + zero-convs)")
 
 # Data paths
 parser.add_argument("--data_root_train", type=str,
-                    default='/data0/zhaojianxiang/preprocessed_data/train-pats_preprocess/',
-                    help="OpenKBP training set (with Mask_*.nii.gz + dose.nii.gz)")
+                    default='/data0/zhaojianxiang/preprocessed_data/train-pats_preprocess/')
 parser.add_argument("--data_root_val", type=str,
-                    default='/data0/zhaojianxiang/preprocessed_data/validation-pats_preprocess/',
-                    help="OpenKBP validation set; pass empty string to disable validation")
+                    default='/data0/zhaojianxiang/preprocessed_data/validation-pats_preprocess/')
 
 # EMA
-parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate (set 0 to disable EMA)")
+parser.add_argument("--ema_decay", type=float, default=0.999)
 
 # Resume
 parser.add_argument("--resume_from", type=str, default="",
-                    help="path to model state_dict (e.g. model_best_mae.pth or ema_best_mae.pth). "
-                         "Loaded into the trainable model with strict=False")
+                    help="v1.2 OR v1.4 model state_dict; loaded with strict=False")
 parser.add_argument("--resume_ema", type=str, default="",
-                    help="path to EMA state_dict. If empty and --resume_from is given, EMA is initialized from --resume_from")
-parser.add_argument("--resume_epoch", type=int, default=0,
-                    help="manual override for starting epoch (auto-detected from checkpoint if 0)")
-parser.add_argument("--save_name_suffix", type=str, default="",
-                    help="append suffix to save_dir to avoid overwriting previous runs")
+                    help="v1.2 OR v1.4 EMA state_dict; partial restore allowed")
+parser.add_argument("--resume_epoch", type=int, default=0)
+parser.add_argument("--save_name_suffix", type=str, default="")
+parser.add_argument("--save_dir", type=str, default="",
+                    help="override checkpoint directory (e.g. resume into existing run folder)")
 
 # Validation / checkpointing
-parser.add_argument("--val_every", type=int, default=25, help="run validation every N epochs (0 disables)")
-parser.add_argument("--val_steps", type=int, default=10, help="Flow Matching Euler steps for validation sampling")
-parser.add_argument("--save_every", type=int, default=25, help="save checkpoint every N epochs")
+parser.add_argument("--val_every", type=int, default=50)
+parser.add_argument("--val_steps", type=int, default=10)
+parser.add_argument("--save_every", type=int, default=50)
 
 args = parser.parse_args()
 
 
 # ----------------------------- EMA UTIL -----------------------------
 class EMA:
-    """Lightweight Polyak / exponential moving average of model parameters.
-
-    Maintains a CPU-or-GPU shadow copy of each trainable parameter and (if any)
-    persistent buffer. Updated after every optimizer.step().
-    """
+    """Polyak/exponential moving average of trainable params."""
 
     def __init__(self, model: torch.nn.Module, decay: float = 0.999, device=None):
         self.decay = decay
@@ -106,7 +140,6 @@ class EMA:
         for name, p in model.named_parameters():
             if p.requires_grad:
                 self.shadow_params[name] = p.detach().clone()
-        # store float buffers too (e.g. running stats); int buffers are skipped
         for name, b in model.named_buffers():
             if b.is_floating_point():
                 self.shadow_buffers[name] = b.detach().clone()
@@ -119,6 +152,8 @@ class EMA:
                 continue
             s = self.shadow_params.get(name)
             if s is None:
+                # New parameter (e.g. adapter unfrozen after warm-up) — initialise shadow now
+                self.shadow_params[name] = p.detach().clone()
                 continue
             s.mul_(d).add_(p.detach(), alpha=1.0 - d)
         for name, b in model.named_buffers():
@@ -126,12 +161,12 @@ class EMA:
                 continue
             s = self.shadow_buffers.get(name)
             if s is None:
+                self.shadow_buffers[name] = b.detach().clone()
                 continue
-            s.copy_(b.detach())  # buffers tracked as-is
+            s.copy_(b.detach())
 
     @contextlib.contextmanager
     def average_parameters(self, model: torch.nn.Module):
-        """Temporarily swap model weights with EMA weights; restore on exit."""
         backup_params = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
         try:
             with torch.no_grad():
@@ -146,16 +181,17 @@ class EMA:
                         p.data.copy_(backup_params[n])
 
     def state_dict_for_save(self, model: torch.nn.Module = None):
-        """Return a state_dict containing EMA params (and current model buffers if model is given).
-
-        With model given, the returned dict is fully compatible with
-        ``model.load_state_dict(..., strict=True)`` for inference.
-        """
         sd = {k: v.detach().clone() for k, v in self.shadow_params.items()}
         if model is not None:
             for name, b in model.named_buffers():
                 sd[name] = b.detach().clone()
         return sd
+
+    def add_missing_params(self, model: torch.nn.Module):
+        """Ensure EMA shadow exists for every trainable parameter."""
+        for name, p in model.named_parameters():
+            if p.requires_grad and name not in self.shadow_params:
+                self.shadow_params[name] = p.detach().clone()
 
 
 # ----------------------------- DISTRIBUTED SETUP -----------------------------
@@ -180,12 +216,17 @@ if any(s % 16 != 0 for s in patch_size):
 if args.model_channels % 32 != 0:
     raise ValueError(f"--model_channels 必须为 32 的倍数 (GroupNorm32), 当前: {args.model_channels}")
 
-train_bs = args.bs
-all_epochs = args.epoch
+# Resolve penalty channel count.
+if args.penalty_channels is not None:
+    penalty_channels = args.penalty_channels
+elif args.penalty_files:
+    penalty_channels = len(args.penalty_files)
+else:
+    penalty_channels = 1 if args.penalty_mode == 'single' else len(DEFAULT_MULTI_PENALTY_FILES)
 
 
+# ----------------------------- AUTO-DETECT START EPOCH -----------------------------
 def _extract_epoch(path: str) -> int:
-    """Extract epoch number from 'model_epoch{NNN}.pth' or 'ema_epoch{NNN}.pth'."""
     if not path:
         return 0
     m = re.search(r'epoch(\d+)\.pth', os.path.basename(path))
@@ -197,35 +238,49 @@ if start_epoch == 0 and args.resume_from:
     start_epoch = _extract_epoch(args.resume_from)
     if is_main:
         print(f"[Resume] auto-detected start_epoch={start_epoch} from --resume_from", flush=True)
-if start_epoch >= all_epochs:
-    raise ValueError(f"start_epoch ({start_epoch}) must be < --epoch ({all_epochs})")
 
-save_name = 'MedSegDiff_Flow_3D_OpenKBP_11ch_mc{}_bs{}_epoch{}'.format(
-    args.model_channels, world_size * args.bs, args.epoch
+total_epochs = args.epoch
+if start_epoch >= total_epochs:
+    raise ValueError(f"start_epoch ({start_epoch}) must be < --epoch ({total_epochs})")
+
+
+# ----------------------------- SAVE DIR -----------------------------
+save_name = (
+    f"MedSegDiff_Flow_3D_OpenKBP_v1_4_mc{args.model_channels}"
+    f"_pc{penalty_channels}_bs{world_size * args.bs}_epoch{total_epochs}"
 )
 if args.save_name_suffix:
     save_name = save_name + '_' + args.save_name_suffix
-# v1 keeps the legacy flat layout (backwards compatible);
-# other model variants are namespaced under their model_name to avoid overlap.
-if args.model_name == 'v1':
-    save_dir = os.path.join('trained_models', save_name)
+if args.save_dir:
+    save_dir = args.save_dir
 else:
-    save_dir = os.path.join('trained_models', args.model_name, save_name)
+    save_dir = os.path.join('trained_models', 'v1_4_penalty_adapter', save_name)
 if is_main:
     os.makedirs(save_dir, exist_ok=True)
+    print(f"[Save] checkpoints -> {save_dir}", flush=True)
 
 
 # ----------------------------- DATA -----------------------------
-train_data = Dataset_PSDM_3D_Train(data_root=args.data_root_train, patch_size=patch_size)
+train_data = Dataset_PSDM_3D_Train_v1_4(
+    data_root=args.data_root_train,
+    patch_size=patch_size,
+    penalty_mode=args.penalty_mode,
+    penalty_files=args.penalty_files,
+)
 train_sampler = Data.distributed.DistributedSampler(train_data)
 train_dataloader = DataLoader(
-    train_data, batch_size=train_bs, sampler=train_sampler,
+    train_data, batch_size=args.bs, sampler=train_sampler,
     shuffle=False, num_workers=4, pin_memory=True,
 )
 
 val_enabled = bool(args.data_root_val) and args.val_every > 0 and os.path.isdir(args.data_root_val)
 if val_enabled:
-    val_data = Dataset_PSDM_3D_Train(data_root=args.data_root_val, patch_size=patch_size)
+    val_data = Dataset_PSDM_3D_Train_v1_4(
+        data_root=args.data_root_val,
+        patch_size=patch_size,
+        penalty_mode=args.penalty_mode,
+        penalty_files=args.penalty_files,
+    )
     val_sampler = Data.distributed.DistributedSampler(val_data, shuffle=False)
     val_dataloader = DataLoader(
         val_data, batch_size=1, sampler=val_sampler,
@@ -239,71 +294,101 @@ if is_main:
     if val_enabled:
         print(f"Val   size: {len(val_data)}  (val_every={args.val_every} epochs, val_steps={args.val_steps})", flush=True)
     else:
-        print(f"Val disabled (data_root_val='{args.data_root_val}', val_every={args.val_every})", flush=True)
+        print(f"Val disabled", flush=True)
 
 
 # ----------------------------- MODEL -----------------------------
-dis_channels = 11  # 11 OpenKBP masks
-syn_channels = 1   # 1 synthetic dose channel
-ModelClass = MODEL_REGISTRY[args.model_name]
-if is_main:
-    print(f"[Model] using model_name='{args.model_name}' -> {ModelClass.__name__}", flush=True)
-
-model = ModelClass(
+syn_channels = 1
+dis_channels = 11
+model = UNetModel_PenaltyAdapter_v1_4(
     image_size=patch_size,
     in_channels=1,
     ct_channels=1,
     syn_channels=syn_channels,
+    dis_channels=dis_channels,
     model_channels=args.model_channels,
     out_channels=1,
     num_res_blocks=2,
     attention_resolutions=(8, 16),
-    channel_mult=(1, 2, 4, 4),
+    channel_mult=tuple(args.channel_mult),
     dims=3,
     use_checkpoint=True,
     use_fp16=False,
+    # v1.4 penalty branch
+    penalty_channels=penalty_channels,
+    penalty_model_channels=args.penalty_model_channels,
+    penalty_num_res_blocks=args.penalty_num_res_blocks,
+    use_penalty_dropout=(not args.disable_penalty_dropout),
+    penalty_dropout_p=args.penalty_dropout_p,
 )
 model = model.to(device)
 
-# ----- Optional: resume from a saved checkpoint -----
+if is_main:
+    n_params_total = sum(p.numel() for p in model.parameters())
+    n_params_adapter = sum(p.numel() for p in model.adapter_parameters())
+    print(
+        f"[Model] UNetModel_PenaltyAdapter_v1_4 | total={n_params_total/1e6:.2f}M | "
+        f"adapter+zero_convs={n_params_adapter/1e6:.2f}M",
+        flush=True,
+    )
+
+# ----- Resume model (strict=False so v1.2 ckpts load cleanly) -----
 if args.resume_from:
     if not os.path.isfile(args.resume_from):
         raise FileNotFoundError(f"--resume_from not found: {args.resume_from}")
     if is_main:
-        print(f"[Resume] Loading model weights from: {args.resume_from}", flush=True)
+        print(f"[Resume] Loading model weights from: {args.resume_from} (strict=False)", flush=True)
     state_dict = torch.load(args.resume_from, map_location='cpu')
-    # checkpoints saved during training also strip 'module.' already; be defensive
     if any(k.startswith('module.') for k in state_dict.keys()):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if is_main:
-        if missing:
-            print(f"[Resume] missing keys ({len(missing)}): {missing[:3]}{' ...' if len(missing) > 3 else ''}", flush=True)
-        if unexpected:
-            print(f"[Resume] unexpected keys ({len(unexpected)}): {unexpected[:3]}{' ...' if len(unexpected) > 3 else ''}", flush=True)
+        n_adapter_missing = sum(
+            1 for k in missing
+            if k.startswith('penalty_adapter.')
+            or k.startswith('penalty_zero_convs.')
+            or k.startswith('penalty_zero_conv_middle.')
+        )
+        print(
+            f"[Resume] missing keys: {len(missing)} (penalty branch newly initialised: {n_adapter_missing}); "
+            f"unexpected: {len(unexpected)}",
+            flush=True,
+        )
     del state_dict
 
-flow_model = FlowMatching(model)
-if args.model_name == 'v1_3_gated_xquery_vit':
-    flow_model = FlowMatchingV13(model)
+# ----- Adapter warm-up: freeze the v1.2 backbone (kept after EMA / DDP setup) -----
+if args.adapter_warmup_epochs > 0 and start_epoch < args.adapter_warmup_epochs:
+    model.freeze_backbone()
+    backbone_frozen = True
+    if is_main:
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[Warmup] Backbone frozen — only training adapter+zero-convs "
+              f"(trainable={n_trainable/1e6:.2f}M, for {args.adapter_warmup_epochs} epochs).",
+              flush=True)
+else:
+    backbone_frozen = False
 
+flow_model = FlowMatchingV14(model)
+
+# DDP wraps every param (frozen or not); find_unused_parameters needed when
+# we freeze the backbone because frozen params will still be in the graph but
+# without gradients.
 ddp_model = DDP(
     model,
     device_ids=[args.local_rank],
     output_device=args.local_rank,
-    find_unused_parameters=False,
+    find_unused_parameters=backbone_frozen,
 )
 flow_model.net = ddp_model
 
-# EMA (each rank keeps an identical copy — all-reduce keeps params in sync)
+# ----- EMA -----
 ema = EMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
 if ema is not None and args.resume_ema:
     if not os.path.isfile(args.resume_ema):
         raise FileNotFoundError(f"--resume_ema not found: {args.resume_ema}")
     if is_main:
-        print(f"[Resume] Loading EMA shadow weights from: {args.resume_ema}", flush=True)
+        print(f"[Resume] Loading EMA shadow from: {args.resume_ema} (partial restore)", flush=True)
     ema_state = torch.load(args.resume_ema, map_location='cpu')
-    # ema state_dict only has trainable params (no buffers); update shadow_params in place
     with torch.no_grad():
         n_loaded = 0
         for name, p in ema.shadow_params.items():
@@ -316,18 +401,20 @@ if ema is not None and args.resume_ema:
 
 
 # ----------------------------- OPTIMIZER + LR -----------------------------
-optimizer = optim.AdamW(ddp_model.parameters(), lr=args.lr_max, weight_decay=args.weight_decay)
+optimizer = optim.AdamW(
+    [p for p in ddp_model.parameters() if p.requires_grad],
+    lr=args.lr_max, weight_decay=args.weight_decay,
+)
 
-warmup_epochs = max(1, int(args.epoch * args.warmup_ratio))
-warmup_epochs = min(warmup_epochs, max(1, args.epoch - 1))
-cosine_epochs = max(1, args.epoch - warmup_epochs)
+warmup_epochs = max(1, int(total_epochs * args.warmup_ratio))
+warmup_epochs = min(warmup_epochs, max(1, total_epochs - 1))
+cosine_epochs = max(1, total_epochs - warmup_epochs)
 warmup_scheduler = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs)
 cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=args.min_lr)
 lr_scheduler = SequentialLR(
     optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
     milestones=[warmup_epochs],
 )
-# Advance scheduler to match resume epoch
 for _ in range(start_epoch):
     lr_scheduler.step()
 
@@ -335,29 +422,26 @@ if is_main:
     resumed_lr = optimizer.param_groups[0]['lr']
     print(
         f"LR schedule: LinearWarmup({warmup_epochs} ep) + Cosine({cosine_epochs} ep), "
-        f"lr_max={args.lr_max}, min_lr={args.min_lr}, weight_decay={args.weight_decay}",
-        flush=True,
-    )
-    print(
-        f"EMA: {'decay=' + str(args.ema_decay) if ema is not None else 'disabled'}",
+        f"lr_max={args.lr_max}, min_lr={args.min_lr}",
         flush=True,
     )
     if start_epoch > 0:
-        print(f"Starting from epoch {start_epoch + 1}/{all_epochs}  lr={resumed_lr:.2e}", flush=True)
+        print(
+            f"[Resume] LR scheduler advanced {start_epoch} epoch(s); "
+            f"optimizer lr={resumed_lr:.6e} (next loop epoch {start_epoch + 1})",
+            flush=True,
+        )
+    print(f"EMA: {'decay=' + str(args.ema_decay) if ema is not None else 'disabled'}", flush=True)
+    print(f"Starting from epoch {start_epoch + 1}/{total_epochs}", flush=True)
 
 
 # ----------------------------- VAL FUNCTION -----------------------------
 @torch.no_grad()
 def evaluate_mae(use_ema: bool):
-    """Compute mean absolute dose error inside Mask_possible_dose_mask.
-
-    Returns aggregated MAE (Gy) across all val patients (averaged over ranks).
-    """
     if not val_enabled:
         return float('nan')
 
     ddp_model.eval()
-
     cm = ema.average_parameters(model) if (use_ema and ema is not None) else contextlib.nullcontext()
 
     mae_sum = torch.zeros(1, device=device)
@@ -368,21 +452,18 @@ def evaluate_mae(use_ema: bool):
         if is_main:
             iterator = tqdm(val_dataloader, desc="[Val ]", leave=False)
 
-        for ct, syn_cond, dis_cond, dose_gt in iterator:
+        for ct, syn_cond, dis_cond, penalty, dose_gt in iterator:
             ct = ct.to(device, non_blocking=True).float()
             syn_cond = syn_cond.to(device, non_blocking=True).float()
             dis_cond = dis_cond.to(device, non_blocking=True).float()
+            penalty = penalty.to(device, non_blocking=True).float()
             dose_gt = dose_gt.to(device, non_blocking=True).float()
 
-            if args.model_name == 'v1_3_gated_xquery_vit':
-                pred = flow_model.sample(ct, syn_cond, steps=args.val_steps)
-            else:
-                pred = flow_model.sample(ct, syn_cond, dis_cond, steps=args.val_steps)
+            pred = flow_model.sample(ct, syn_cond, dis_cond, penalty, steps=args.val_steps)
 
             pred_gy = torch.clamp((pred + 1.0) * 40.0, 0.0, 80.0)
             gt_gy = torch.clamp((dose_gt + 1.0) * 40.0, 0.0, 80.0)
 
-            # possible_dose_mask is channel index 10 of dis (see OPENKBP_MASK_NAMES)
             body_mask = dis_cond[:, 10:11, ...]
 
             for b in range(ct.shape[0]):
@@ -405,14 +486,41 @@ best_mae = float('inf')
 best_mae_epoch = -1
 best_mae_use_ema = False
 
-for epoch in range(start_epoch, all_epochs):
+for epoch in range(start_epoch, total_epochs):
+    # ----- Adapter warm-up boundary: unfreeze backbone & rebuild optimizer -----
+    if backbone_frozen and epoch >= args.adapter_warmup_epochs:
+        model.unfreeze_backbone()
+        backbone_frozen = False
+        if ema is not None:
+            ema.add_missing_params(model)
+        # Rebuild DDP without find_unused_parameters now that all params are active.
+        ddp_model = DDP(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
+        )
+        flow_model.net = ddp_model
+        optimizer = optim.AdamW(
+            [p for p in ddp_model.parameters() if p.requires_grad],
+            lr=optimizer.param_groups[0]['lr'],
+            weight_decay=args.weight_decay,
+        )
+        # Re-build LR scheduler from current point.
+        remaining = max(1, total_epochs - epoch)
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=remaining, eta_min=args.min_lr)
+        lr_scheduler = cosine_scheduler
+        if is_main:
+            print(f"[Warmup] Done. Unfroze backbone at epoch {epoch + 1}; "
+                  f"continuing joint training.", flush=True)
+
     train_sampler.set_epoch(epoch)
     current_lr = optimizer.param_groups[0]['lr']
     ddp_model.train()
 
     train_epoch_loss = []
     if is_main:
-        loader = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{all_epochs}")
+        loader = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{total_epochs}")
     else:
         loader = train_dataloader
 
@@ -421,16 +529,15 @@ for epoch in range(start_epoch, all_epochs):
 
     n_batches = len(train_dataloader)
 
-    for i, (ct, syn_cond, dis_cond, rtdose) in enumerate(loader):
+    for i, batch in enumerate(loader):
+        ct, syn_cond, dis_cond, penalty, rtdose = batch
         ct = ct.to(device, non_blocking=True).float()
         syn_cond = syn_cond.to(device, non_blocking=True).float()
         dis_cond = dis_cond.to(device, non_blocking=True).float()
+        penalty = penalty.to(device, non_blocking=True).float()
         rtdose = rtdose.to(device, non_blocking=True).float()
 
-        if args.model_name == 'v1_3_gated_xquery_vit':
-            loss_raw = flow_model.get_loss(rtdose, ct, syn_cond)
-        else:
-            loss_raw = flow_model.get_loss(rtdose, ct, syn_cond, dis_cond)
+        loss_raw = flow_model.get_loss(rtdose, ct, syn_cond, dis_cond, penalty)
         loss_scaled = loss_raw / grad_accum_steps
         loss_scaled.backward()
 
@@ -442,10 +549,12 @@ for epoch in range(start_epoch, all_epochs):
         is_accum_step = (i + 1) % grad_accum_steps == 0
         is_last_batch = (i + 1) == n_batches
         if is_accum_step or is_last_batch:
-            torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in ddp_model.parameters() if p.requires_grad],
+                args.grad_clip,
+            )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            # EMA update once per optimizer step
             if ema is not None:
                 ema.update(model)
 
@@ -456,23 +565,22 @@ for epoch in range(start_epoch, all_epochs):
 
     if is_main:
         mean_loss = float(np.mean(train_epoch_loss))
-        print(f"Epoch {epoch + 1}/{all_epochs}  lr={current_lr:.2e}  train_loss={mean_loss:.4f}", flush=True)
+        print(f"Epoch {epoch + 1}/{total_epochs}  lr={current_lr:.2e}  train_loss={mean_loss:.4f}", flush=True)
 
     # ----- Validation -----
     run_val = val_enabled and ((epoch + 1) % args.val_every == 0)
     if run_val:
-        # Validate with EMA weights if available, else with current weights
         val_mae = evaluate_mae(use_ema=(ema is not None))
 
         if is_main:
             tag = "EMA" if ema is not None else "raw"
-            print(f"  [Val] epoch {epoch + 1}  MAE({tag})={val_mae:.4f} Gy  (best={best_mae:.4f} @epoch{best_mae_epoch})", flush=True)
+            print(f"  [Val] epoch {epoch + 1}  MAE({tag})={val_mae:.4f} Gy  "
+                  f"(best={best_mae:.4f} @epoch{best_mae_epoch})", flush=True)
 
             if val_mae < best_mae:
                 best_mae = val_mae
                 best_mae_epoch = epoch + 1
                 best_mae_use_ema = (ema is not None)
-                # save best raw + best EMA
                 torch.save(model.state_dict(), os.path.join(save_dir, 'model_best_mae.pth'))
                 if ema is not None:
                     torch.save(ema.state_dict_for_save(model), os.path.join(save_dir, 'ema_best_mae.pth'))
@@ -485,7 +593,6 @@ for epoch in range(start_epoch, all_epochs):
             torch.save(ema.state_dict_for_save(model), os.path.join(save_dir, f'ema_epoch{epoch + 1}.pth'))
 
 if is_main:
-    # final save
     torch.save(model.state_dict(), os.path.join(save_dir, 'model_final.pth'))
     if ema is not None:
         torch.save(ema.state_dict_for_save(model), os.path.join(save_dir, 'ema_final.pth'))

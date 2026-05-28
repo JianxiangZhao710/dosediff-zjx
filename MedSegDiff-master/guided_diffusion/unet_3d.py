@@ -222,11 +222,12 @@ class UNetModel_MS_Former_3D(nn.Module):
         image_size, # (D, H, W) or int
         in_channels,
         ct_channels,
-        dis_channels,
-        model_channels,
-        out_channels,
-        num_res_blocks,
-        attention_resolutions,
+        syn_channels=1,
+        dis_channels=11,
+        model_channels=64,
+        out_channels=1,
+        num_res_blocks=2,
+        attention_resolutions=(8, 16),
         dropout=0,
         channel_mult=(1, 2, 4, 8),
         conv_resample=True,
@@ -279,6 +280,9 @@ class UNetModel_MS_Former_3D(nn.Module):
         self.input_blocks_CT = nn.ModuleList([
             TimestepEmbedSequential(conv_nd(dims, ct_channels, ch, 3, padding=1))
         ])
+        self.input_blocks_SYN = nn.ModuleList([
+            TimestepEmbedSequential(conv_nd(dims, syn_channels, ch, 3, padding=1))
+        ])
         self.input_blocks_DIS = nn.ModuleList([
             TimestepEmbedSequential(conv_nd(dims, dis_channels, ch, 3, padding=1))
         ])
@@ -291,6 +295,7 @@ class UNetModel_MS_Former_3D(nn.Module):
             for _ in range(num_res_blocks):
                 layers = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
                 layers_CT = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
+                layers_SYN = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
                 layers_DIS = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
                 
                 ch = int(mult * model_channels)
@@ -298,10 +303,12 @@ class UNetModel_MS_Former_3D(nn.Module):
                 if ds in attention_resolutions:
                     layers.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
                     layers_CT.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
+                    layers_SYN.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
                     layers_DIS.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
                 
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self.input_blocks_CT.append(TimestepEmbedSequential(*layers_CT))
+                self.input_blocks_SYN.append(TimestepEmbedSequential(*layers_SYN))
                 self.input_blocks_DIS.append(TimestepEmbedSequential(*layers_DIS))
                 
                 self._feature_size += ch
@@ -312,10 +319,12 @@ class UNetModel_MS_Former_3D(nn.Module):
                 # Downsample
                 layers = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
                 layers_CT = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
+                layers_SYN = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
                 layers_DIS = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
                 
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self.input_blocks_CT.append(TimestepEmbedSequential(*layers_CT))
+                self.input_blocks_SYN.append(TimestepEmbedSequential(*layers_SYN))
                 self.input_blocks_DIS.append(TimestepEmbedSequential(*layers_DIS))
                 
                 ch = out_ch
@@ -374,7 +383,7 @@ class UNetModel_MS_Former_3D(nn.Module):
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
 
-    def forward(self, x, timesteps, ct, dis, y=None):
+    def forward(self, x, timesteps, ct, syn, dis, y=None):
         hs = []
         # timestep_embedding 默认是 float32；如果开启 use_fp16，则 time_embed 权重是 fp16，
         # 需要保证输入 dtype 一致，避免 Float/Half 不匹配。
@@ -383,24 +392,28 @@ class UNetModel_MS_Former_3D(nn.Module):
 
         h = x.type(self.dtype)
         h_ct = ct.type(self.dtype)
+        h_syn = syn.type(self.dtype)
         h_dis = dis.type(self.dtype)
         
         last_ct_feat = None
+        last_syn_feat = None
         last_dis_feat = None
         
         # Multi-Stream Encoder
         for i, module in enumerate(self.input_blocks):
             h_ct = self.input_blocks_CT[i](h_ct, emb)
+            h_syn = self.input_blocks_SYN[i](h_syn, emb)
             h_dis = self.input_blocks_DIS[i](h_dis, emb)
-            h = module(h, emb) + h_ct + h_dis
+            h = module(h, emb) + h_ct + h_syn + h_dis
             hs.append(h)
             
             # Keep track of last features for Bottleneck Fusion
             last_ct_feat = h_ct
+            last_syn_feat = h_syn
             last_dis_feat = h_dis
         
         # --- ViT Fusion at Bottleneck ---
-        h = self.fusion(last_ct_feat, last_dis_feat, h) + h
+        h = self.fusion.forward_4(last_ct_feat, last_syn_feat, last_dis_feat, h) + h
         
         # Middle
         h = self.middle_block(h, emb)

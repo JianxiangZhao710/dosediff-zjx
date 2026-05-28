@@ -15,6 +15,8 @@ from tqdm import tqdm
 from guided_diffusion.dose_loader_3d import Dataset_PSDM_3D_Train, OPENKBP_MASK_NAMES
 from guided_diffusion.unet_3d import UNetModel_MS_Former_3D
 from guided_diffusion.unet_3d_v1_1 import UNetModel_GatedXQueryViT_3D
+from guided_diffusion.unet_3d_v1_2 import UNetModel_GatedXQueryViT_3D_v1_2
+from guided_diffusion.unet_3d_v2 import UNetModel_ControlSwinFlow_3D
 from flow_matching import FlowMatching
 
 
@@ -22,6 +24,8 @@ from flow_matching import FlowMatching
 MODEL_REGISTRY = {
     'v1': UNetModel_MS_Former_3D,
     'v1_1_gated_xquery_vit': UNetModel_GatedXQueryViT_3D,
+    'v1_2_gated_xquery_vit': UNetModel_GatedXQueryViT_3D_v1_2,
+    'v2_control_swin_flow_unet': UNetModel_ControlSwinFlow_3D,
 }
 
 def denormalize_dose(dose, dose_max=80.0, dose_norm_factor=40.0):
@@ -36,7 +40,7 @@ def normalize_ct(img):
     img = img / 1250.0 - 1.0
     return img
 
-def predict_full_volume(model, ct_volume, cond_volume, patch_size=(64, 128, 128),
+def predict_full_volume(model, ct_volume, syn_volume, cond_volume, patch_size=(64, 128, 128),
                         batch_size=1, steps=50, device='cuda'):
     """
     对整个3D体积进行预测（使用滑动窗口）
@@ -44,6 +48,7 @@ def predict_full_volume(model, ct_volume, cond_volume, patch_size=(64, 128, 128)
     Args:
         model: FlowMatching模型
         ct_volume: CT数据 (D, H, W)
+        syn_volume: Synthetic dose数据 (D, H, W)
         cond_volume: 条件通道 (C, D, H, W)，OpenKBP 配置下 C=11（11 个 mask）
         patch_size: patch大小 (D, H, W)
         batch_size: batch大小
@@ -93,6 +98,7 @@ def predict_full_volume(model, ct_volume, cond_volume, patch_size=(64, 128, 128)
                     w_end = min(w + patch_w, W)
                     
                     ct_patch = ct_volume[d:d_end, h:h_end, w:w_end]
+                    syn_patch = syn_volume[d:d_end, h:h_end, w:w_end]
                     cond_patch = cond_volume[:, d:d_end, h:h_end, w:w_end]
 
                     if ct_patch.shape != patch_size:
@@ -105,13 +111,18 @@ def predict_full_volume(model, ct_volume, cond_volume, patch_size=(64, 128, 128)
                             ((0, pad_d), (0, pad_h), (0, pad_w)),
                             'constant', constant_values=-1.0,
                         )
+                        syn_patch = np.pad(
+                            syn_patch,
+                            ((0, pad_d), (0, pad_h), (0, pad_w)),
+                            'constant', constant_values=-1.0,
+                        )
                         cond_patch = np.pad(
                             cond_patch,
                             ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)),
                             'constant', constant_values=0.0,
                         )
 
-                    patches.append((ct_patch, cond_patch))
+                    patches.append((ct_patch, syn_patch, cond_patch))
                     positions.append((d, h, w, d_end, h_end, w_end))
         
         # 批量预测（逐个处理以减少内存使用）
@@ -119,17 +130,18 @@ def predict_full_volume(model, ct_volume, cond_volume, patch_size=(64, 128, 128)
             batch_patches = patches[i:i+batch_size]
             batch_positions = positions[i:i+batch_size]
             
-            for patch_idx, (ct_patch, cond_patch) in enumerate(batch_patches):
+            for patch_idx, (ct_patch, syn_patch, cond_patch) in enumerate(batch_patches):
                 d, h, w, d_end, h_end, w_end = batch_positions[patch_idx]
 
                 ct_tensor = torch.from_numpy(ct_patch).unsqueeze(0).unsqueeze(0).float().to(device)  # (1, 1, D, H, W)
+                syn_tensor = torch.from_numpy(syn_patch).unsqueeze(0).unsqueeze(0).float().to(device)  # (1, 1, D, H, W)
                 cond_tensor = torch.from_numpy(cond_patch).unsqueeze(0).float().to(device)  # (1, C, D, H, W)
 
                 with torch.cuda.device(device):
-                    pred_patch = model.sample(ct_tensor, cond_tensor, steps=steps)  # (1, 1, D, H, W)
+                    pred_patch = model.sample(ct_tensor, syn_tensor, cond_tensor, steps=steps)  # (1, 1, D, H, W)
                     pred_patch = pred_patch.squeeze(0).squeeze(0).cpu().numpy()  # (D, H, W)
 
-                del ct_tensor, cond_tensor
+                del ct_tensor, syn_tensor, cond_tensor
                 torch.cuda.empty_cache()
                 
                 # 裁剪到实际大小
@@ -201,6 +213,7 @@ def main():
         image_size=patch_size,
         in_channels=1,
         ct_channels=1,
+        syn_channels=1,
         dis_channels=dis_channels,
         model_channels=args.model_channels,
         out_channels=1,
@@ -263,6 +276,15 @@ def main():
 
         ct_data = normalize_ct(ct_data)
 
+        # Load synthetic dose
+        syn_path = os.path.join(patient_dir, 'dose_synthetic.nii.gz')
+        if os.path.exists(syn_path):
+            syn_data = nib.load(syn_path).get_fdata().astype(np.float32).transpose(2, 0, 1)
+            syn_data = np.clip(syn_data, 0, 80)
+            syn_data = syn_data / 40.0 - 1.0  # normalize same as dose
+        else:
+            syn_data = np.zeros_like(ct_data)
+
         empty_shape = ct_data.shape
         mask_channels = []
         for name in mask_names:
@@ -278,7 +300,7 @@ def main():
 
         print(f"Predicting for {patient_id}...")
         pred_dose = predict_full_volume(
-            flow_model, ct_data, cond_volume,
+            flow_model, ct_data, syn_data, cond_volume,
             patch_size=patch_size,
             batch_size=args.batch_size,
             steps=args.steps,

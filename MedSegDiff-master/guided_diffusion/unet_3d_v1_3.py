@@ -1,28 +1,25 @@
 """
-v1.1 — Conditional 3D UNet velocity-field network with two structural upgrades.
+v1.3 — Conditional 3D UNet velocity-field network.
 
-Inherits the v1 backbone (3 parallel encoders X / CT / DIS + UNet decoder) but:
+Changes vs ``unet_3d_v1_2.py`` (UNetModel_GatedXQueryViT_3D_v1_2):
 
-1. Encoder fusion: simple addition  ->  gated fusion
-       h_x    = input_blocks[i](h, emb)
-       h_ct   = input_blocks_CT[i](h_ct, emb)
-       h_dis  = input_blocks_DIS[i](h_dis, emb)
-       h_cond = cond_proj[i]( cat([h_ct, h_dis], 1) )           # 2C -> C  (1x1x1 conv)
-       gate   = sigmoid( gate_proj[i]( cat([h_x, h_cond], 1) ) )# 2C -> C  (1x1x1 conv)
-       h      = h_x + gate * h_cond
-       hs.append(h)                                             # skip uses fused h
+1. DROPS DIS: the 11-channel structure mask is no longer used as a condition.
+   - ``input_blocks_DIS`` is removed.
+   - ``cond_proj`` now fuses CT + SYN -> h_cond (2C -> C) instead of CT + SYN + DIS (3C -> C).
+   - ``gate_proj`` is unchanged (h_x + gate * h_cond, same bias init).
+   - ``dis_channels`` argument is removed from the constructor.
 
-2. Bottleneck ViT: ViT_fusion_3D(Q=CT, K=DIS, V=X)  ->  ViT_fusion_3D_XQuery(x_feat, cond_feat)
-       cond_feat = vit_cond_proj( cat([last_h_ct, last_h_dis], 1) )
-       vit_out   = fusion(last_h_x, cond_feat)
-       h         = last_h_x + vit_out      # bottleneck input to middle_block
+2. Encoder: 3-stream (X / CT / SYN) instead of 4-stream.
+   - ``last_h_syn`` is tracked (was new in v1.2; retained here).
+   - ``last_h_dis`` is removed.
 
-The decoder (incl. skip-concat path), middle_block and output projection are unchanged.
-``model(x, t, ct, dis) -> v`` forward signature is preserved.
+3. Bottleneck ViT: uses ``ViT_fusion_3D_XQuery_v1_3`` which calls
+   ``forward_3(ct_feat, ct_syn_fused)``.
+   - Q from CT, K and V from projected CT + SYN fusion.
 
-All other building blocks are reused unchanged from ``unet_3d.py``:
-``TimestepBlock``, ``TimestepEmbedSequential``, ``Upsample``, ``Downsample``,
-``ResBlock``, ``AttentionBlock``.
+4. ``forward(x, timesteps, ct, syn)`` — DIS argument is removed.
+
+All other I/O shapes and hyper-parameters are identical to v1.2.
 """
 import torch as th
 import torch.nn as nn
@@ -35,7 +32,6 @@ from .nn import (
     timestep_embedding,
     checkpoint,
 )
-
 from .unet_3d import (
     TimestepEmbedSequential,
     Upsample,
@@ -43,31 +39,48 @@ from .unet_3d import (
     ResBlock,
     AttentionBlock,
 )
+from .vit_v1_3 import ViT_fusion_3D_XQuery_v1_3
 
-from .vit_v1_1 import ViT_fusion_3D_XQuery
 
+class UNetModel_GatedXQueryViT_3D_v1_3(nn.Module):
+    """v1.3 velocity-field network — 3-condition (CT / SYN / t), no DIS.
 
-class UNetModel_GatedXQueryViT_3D(nn.Module):
-    """v1.1 velocity-field network.
-
-    Args mirror ``UNetModel_MS_Former_3D`` so existing training/inference code can swap by name.
-
-    Additional behaviour:
-        - One ``cond_proj`` (1x1x1 Conv3D) per encoder block, with input 2C and output C
-          where C = output channels of that block (same across X/CT/DIS streams).
-        - One ``gate_proj`` (1x1x1 Conv3D) per encoder block; bias initialised to -2.0 so the
-          initial gate is sigmoid(-2) ~ 0.12 (gentle condition injection at the start of training).
-        - One bottleneck ``vit_cond_proj`` (1x1x1 Conv3D) that projects cat([h_ct, h_dis], 1)
-          (2C) to C channels before feeding cond_feat to the X-query ViT.
+    Args:
+        image_size     : (D, H, W) or int
+        in_channels    : channels for the noisy dose input x_t (1)
+        ct_channels    : channels for the CT condition (1)
+        syn_channels   : channels for the synthetic dose condition (1)
+        model_channels : base channel count
+        out_channels   : output channels (1 for velocity v)
+        num_res_blocks : ResBlocks per encoder/decoder level
+        attention_resolutions: feature sizes at which to apply AttentionBlock
+        dropout        : dropout probability
+        channel_mult   : channel multipliers per level
+        conv_resample  : use strided conv instead of pool for down/up
+        dims           : dimensionality (3)
+        num_classes    : unused (kept for API compatibility)
+        use_checkpoint : gradient checkpointing
+        use_fp16       : use float16
+        num_heads      : attention heads
+        num_head_channels: channels per head (-1 = infer)
+        num_heads_upsample: heads for upsampling attention
+        use_scale_shift_norm: use scale/shift in GroupNorm
+        resblock_updown: use ResBlock for down/up sampling
+        use_new_attention_order: unused
+        vit_dim        : ViT hidden dimension
+        vit_heads      : ViT attention heads
+        vit_mlp_dim    : ViT FFN hidden dimension
+        vit_dim_head   : ViT per-head channel count
+        vit_patch_size : ViT patch size (D, H, W)
+        gate_init_bias : bias init value for gate_proj (default -2.0)
     """
 
     def __init__(
         self,
-        image_size,           # (D, H, W) or int
+        image_size,
         in_channels,
         ct_channels,
         syn_channels=1,
-        dis_channels=11,
         model_channels=64,
         out_channels=1,
         num_res_blocks=2,
@@ -85,7 +98,6 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
-        # v1.1 specific
         vit_dim=1024,
         vit_heads=4,
         vit_mlp_dim=2048,
@@ -124,7 +136,7 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
 
         ch = input_ch = int(channel_mult[0] * model_channels)
 
-        # ----- Three-stream input blocks (same topology as v1) -----
+        # ----- Three-stream input blocks (X / CT / SYN) -----
         self.input_blocks = nn.ModuleList([
             TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))
         ])
@@ -134,11 +146,8 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
         self.input_blocks_SYN = nn.ModuleList([
             TimestepEmbedSequential(conv_nd(dims, syn_channels, ch, 3, padding=1))
         ])
-        self.input_blocks_DIS = nn.ModuleList([
-            TimestepEmbedSequential(conv_nd(dims, dis_channels, ch, 3, padding=1))
-        ])
 
-        input_block_chans = [ch]  # tracks output ch of each input_blocks[i]
+        input_block_chans = [ch]
         ds = 1
 
         for level, mult in enumerate(channel_mult):
@@ -150,18 +159,14 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
                                       use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
                 layers_SYN = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims,
                                        use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
-                layers_DIS = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims,
-                                       use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
                 ch = out_ch
                 if ds in attention_resolutions:
                     layers.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
                     layers_CT.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
                     layers_SYN.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
-                    layers_DIS.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self.input_blocks_CT.append(TimestepEmbedSequential(*layers_CT))
                 self.input_blocks_SYN.append(TimestepEmbedSequential(*layers_SYN))
-                self.input_blocks_DIS.append(TimestepEmbedSequential(*layers_DIS))
                 input_block_chans.append(ch)
 
             if level != len(channel_mult) - 1:
@@ -184,45 +189,37 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
                     if resblock_updown else
                     Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                 ]
-                layers_DIS = [
-                    ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims,
-                             use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True)
-                    if resblock_updown else
-                    Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)
-                ]
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self.input_blocks_CT.append(TimestepEmbedSequential(*layers_CT))
                 self.input_blocks_SYN.append(TimestepEmbedSequential(*layers_SYN))
-                self.input_blocks_DIS.append(TimestepEmbedSequential(*layers_DIS))
                 ch = out_ch
                 input_block_chans.append(ch)
                 ds *= 2
 
-        # ----- v1.1: per-block gated condition fusion -----
-        # cond_proj[i]: cat(h_ct, h_syn, h_dis) (3C) -> h_cond (C)
+        # ----- Per-block gated condition fusion (2C -> C, dropping DIS) -----
+        # cond_proj[i]: cat(h_ct, h_syn) (2C) -> h_cond (C)
         # gate_proj[i]: cat(h_x, h_cond) (2C) -> gate logits (C). bias init -> gate_init_bias.
         self.cond_proj = nn.ModuleList()
         self.gate_proj = nn.ModuleList()
         for c in input_block_chans:
-            cp = conv_nd(dims, 3 * c, c, 1)
+            cp = conv_nd(dims, 2 * c, c, 1)
             self.cond_proj.append(cp)
             gp = conv_nd(dims, 2 * c, c, 1)
-            # Zero-init weights so initial output is exactly the bias, then bias = -2.0.
             nn.init.zeros_(gp.weight)
             nn.init.constant_(gp.bias, gate_init_bias)
             self.gate_proj.append(gp)
 
-        # ----- Bottleneck cond projection + X-query ViT -----
+        # ----- Bottleneck: ViT with 3-condition input -----
         ds_factor = 2 ** (len(channel_mult) - 1)
         if isinstance(image_size, int):
             feature_size = (image_size // ds_factor, image_size // ds_factor, image_size // ds_factor)
         else:
             feature_size = tuple([s // ds_factor for s in image_size])
 
-        # Project cat([last_h_ct, last_h_syn, last_h_dis], 1) (3*ch) -> ch
-        self.vit_cond_proj = conv_nd(dims, 3 * ch, ch, 1)
+        # Project cat([last_h_ct, last_h_syn], 1) (2*ch) -> ch
+        self.vit_cond_proj = conv_nd(dims, 2 * ch, ch, 1)
 
-        self.fusion = ViT_fusion_3D_XQuery(
+        self.fusion = ViT_fusion_3D_XQuery_v1_3(
             image_size=feature_size,
             patch_size=vit_patch_size,
             dim=vit_dim,
@@ -232,7 +229,7 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
             dim_head=vit_dim_head,
         )
 
-        # ----- Middle Block (unchanged) -----
+        # ----- Middle Block -----
         self.middle_block = TimestepEmbedSequential(
             ResBlock(ch, time_embed_dim, dropout, dims=dims, use_checkpoint=use_checkpoint,
                      use_scale_shift_norm=use_scale_shift_norm),
@@ -241,7 +238,7 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
                      use_scale_shift_norm=use_scale_shift_norm),
         )
 
-        # ----- Output Blocks (unchanged) -----
+        # ----- Output Blocks -----
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
@@ -270,20 +267,19 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
 
-    def _vit_bottleneck(self, last_h_x, last_h_ct, last_h_syn, last_h_dis):
-        """X-query ViT at bottleneck (checkpoint-friendly)."""
-        cond_feat = self.vit_cond_proj(th.cat([last_h_ct, last_h_syn, last_h_dis], dim=1))
-        return last_h_x + self.fusion(last_h_x, cond_feat)
+    def _vit_bottleneck(self, last_h_x, last_h_ct, last_h_syn):
+        """v1.3 bottleneck: call ViT forward_3 with CT + SYN fusion."""
+        cond_fused = self.vit_cond_proj(th.cat([last_h_ct, last_h_syn], dim=1))
+        return last_h_x + self.fusion.forward_3(last_h_ct, cond_fused)
 
-    def forward(self, x, timesteps, ct, syn, dis, y=None):
-        """v1.1 forward.
+    def forward(self, x, timesteps, ct, syn, y=None):
+        """v1.3 forward.
 
         Args:
             x        : (B, in_channels,  D, H, W)  — noisy dose x_t.
-            timesteps: (B,)                         — Flow Matching time (already scaled to [0, 1000]).
+            timesteps: (B,)                         — Flow Matching time (scaled to [0, 1000]).
             ct       : (B, ct_channels,  D, H, W)
             syn      : (B, syn_channels, D, H, W)
-            dis      : (B, dis_channels, D, H, W)
 
         Returns:
             (B, out_channels, D, H, W)  — predicted velocity v.
@@ -295,25 +291,22 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
         h = x.type(self.dtype)
         h_ct = ct.type(self.dtype)
         h_syn = syn.type(self.dtype)
-        h_dis = dis.type(self.dtype)
 
         last_h_x = None
         last_h_ct = None
         last_h_syn = None
-        last_h_dis = None
 
-        # ----- Gated 4-stream encoder -----
+        # ----- Gated 3-stream encoder -----
         for i, module in enumerate(self.input_blocks):
             h_x = module(h, emb)
             h_ct = self.input_blocks_CT[i](h_ct, emb)
             h_syn = self.input_blocks_SYN[i](h_syn, emb)
-            h_dis = self.input_blocks_DIS[i](h_dis, emb)
 
             cond_proj_i = self.cond_proj[i]
             gate_proj_i = self.gate_proj[i]
 
-            def _gated_fuse(h_x_, h_ct_, h_syn_, h_dis_, _cp=cond_proj_i, _gp=gate_proj_i):
-                h_cond_ = _cp(th.cat([h_ct_, h_syn_, h_dis_], dim=1))
+            def _gated_fuse(h_x_, h_ct_, h_syn_, _cp=cond_proj_i, _gp=gate_proj_i):
+                h_cond_ = _cp(th.cat([h_ct_, h_syn_], dim=1))
                 gate_ = th.sigmoid(_gp(th.cat([h_x_, h_cond_], dim=1)))
                 return h_x_ + gate_ * h_cond_
 
@@ -322,29 +315,28 @@ class UNetModel_GatedXQueryViT_3D(nn.Module):
             )
             h = checkpoint(
                 _gated_fuse,
-                (h_x, h_ct, h_syn, h_dis),
+                (h_x, h_ct, h_syn),
                 fuse_params,
                 self.use_checkpoint,
             )
-            hs.append(h)  # skip connection uses the gated fused feature
+            hs.append(h)
 
             last_h_x = h_x
             last_h_ct = h_ct
             last_h_syn = h_syn
-            last_h_dis = h_dis
 
-        # ----- X-query ViT cross-attention at bottleneck -----
+        # ----- X-query ViT cross-attention at bottleneck (3-condition) -----
         vit_params = (
             list(self.vit_cond_proj.parameters()) + list(self.fusion.parameters())
         )
         h = checkpoint(
             self._vit_bottleneck,
-            (last_h_x, last_h_ct, last_h_syn, last_h_dis),
+            (last_h_x, last_h_ct, last_h_syn),
             vit_params,
             self.use_checkpoint,
         )
 
-        # ----- Middle + Decoder (unchanged) -----
+        # ----- Middle + Decoder -----
         h = self.middle_block(h, emb)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)

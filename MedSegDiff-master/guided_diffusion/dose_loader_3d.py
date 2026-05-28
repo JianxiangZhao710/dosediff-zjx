@@ -21,19 +21,21 @@ OPENKBP_MASK_NAMES = [
 
 
 class Dataset_PSDM_3D_Train(Dataset):
-    """OpenKBP 3D 数据集：输入 CT + 11 个二值 mask 作为条件，目标为 dose。
+    """OpenKBP 3D 数据集：输入 CT + 11 个二值 mask + 合成剂量作为条件，目标为 dose。
 
     每个病人目录应包含：
         - ct.nii.gz
         - dose.nii.gz
+        - dose_synthetic.nii.gz (合成剂量作为条件)
         - Mask_<organ>.nii.gz  (共 11 个，缺失自动用全零代替)
     """
 
-    def __init__(self, data_root, patch_size=(64, 128, 128), mask_names=None):
+    def __init__(self, data_root, patch_size=(64, 128, 128), mask_names=None, use_synthetic_dose=True):
         self.data_root = data_root
         self.patch_size = patch_size
         self.mask_names = mask_names if mask_names is not None else OPENKBP_MASK_NAMES
         self.num_mask_channels = len(self.mask_names)
+        self.use_synthetic_dose = use_synthetic_dose
         self.patient_list = sorted([
             p for p in os.listdir(data_root)
             if os.path.isdir(os.path.join(data_root, p))
@@ -41,7 +43,8 @@ class Dataset_PSDM_3D_Train(Dataset):
 
         print(
             f"Dataset initialized. Found {len(self.patient_list)} patients in {data_root}. "
-            f"Using {self.num_mask_channels} mask channels."
+            f"Using {self.num_mask_channels} mask channels. "
+            f"Synthetic dose: {'enabled' if use_synthetic_dose else 'disabled'}."
         )
 
     def __len__(self):
@@ -72,6 +75,16 @@ class Dataset_PSDM_3D_Train(Dataset):
         dose_data = nib.load(os.path.join(patient_dir, 'dose.nii.gz')).get_fdata().astype(np.float32)
         dose_data = dose_data.transpose(2, 0, 1)
 
+        if self.use_synthetic_dose:
+            syn_path = os.path.join(patient_dir, 'dose_synthetic.nii.gz')
+            syn_data = self.load_nii(syn_path)
+            if syn_data is None:
+                syn_data = np.zeros_like(dose_data)
+            else:
+                syn_data = syn_data.transpose(2, 0, 1)
+        else:
+            syn_data = np.zeros_like(dose_data)
+
         empty_shape = ct_data.shape  # (D, H, W)
 
         mask_channels = []
@@ -89,6 +102,7 @@ class Dataset_PSDM_3D_Train(Dataset):
 
         ct_data = self.normalize_ct(ct_data)
         dose_data = self.normalize_dose(dose_data)
+        syn_data = self.normalize_dose(syn_data)
 
         current_depth = ct_data.shape[0]
         target_depth = self.patch_size[0]
@@ -99,22 +113,27 @@ class Dataset_PSDM_3D_Train(Dataset):
 
             ct_crop = ct_data[start_z:end_z, :, :]
             dose_crop = dose_data[start_z:end_z, :, :]
+            syn_crop = syn_data[start_z:end_z, :, :]
             dis_crop = dis_stack[:, start_z:end_z, :, :]
         elif current_depth < target_depth:
             pad_z = target_depth - current_depth
             ct_crop = np.pad(ct_data, ((0, pad_z), (0, 0), (0, 0)), 'constant', constant_values=-1.0)
             dose_crop = np.pad(dose_data, ((0, pad_z), (0, 0), (0, 0)), 'constant', constant_values=-1.0)
+            syn_crop = np.pad(syn_data, ((0, pad_z), (0, 0), (0, 0)), 'constant', constant_values=-1.0)
             dis_crop = np.pad(dis_stack, ((0, 0), (0, pad_z), (0, 0), (0, 0)), 'constant', constant_values=0)
         else:
             ct_crop = ct_data
             dose_crop = dose_data
+            syn_crop = syn_data
             dis_crop = dis_stack
 
         ct_crop = ct_crop[np.newaxis, ...]
         dose_crop = dose_crop[np.newaxis, ...]
+        syn_crop = syn_crop[np.newaxis, ...]
 
         return (
             torch.from_numpy(ct_crop),       # (1,  D, H, W)
-            torch.from_numpy(dis_crop),      # (11, D, H, W)
-            torch.from_numpy(dose_crop),     # (1,  D, H, W)
+            torch.from_numpy(syn_crop),       # (1,  D, H, W) - synthetic dose condition
+            torch.from_numpy(dis_crop),       # (11, D, H, W)
+            torch.from_numpy(dose_crop),      # (1,  D, H, W) - target
         )

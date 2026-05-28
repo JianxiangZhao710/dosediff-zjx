@@ -116,3 +116,35 @@ class ViT_fusion_3D_XQuery(nn.Module):
         out_tokens = self.return_linear(out_tokens)       # (B, N, patch_dim)
         out = self.reshape_back(out_tokens)               # (B, C, D, H, W)
         return out
+
+    def forward_4(self, x_ct, x_syn, x_dis, x_main):
+        """
+        4-input entry point used by v1.2 (and v1 bottleneck fusion).
+
+        Args:
+            x_ct   : (B, C, D, H, W)  — CT feature, used as Q
+            x_syn  : (B, 1, D, H, W)  — synthetic dose feature
+            x_dis  : (B, 11, D, H, W) — DIS mask feature
+            x_main : (B, C, D, H, W)  — Main(X) feature, used as V
+
+        Returns:
+            (B, C, D, H, W) — ViT-refined Main feature
+        """
+        # Fused condition = CT + SYN + DIS (same as v1 ViT_fusion_3D)
+        x_k = x_ct + x_syn + x_dis
+
+        # Q from CT, K/V from fused condition / Main
+        q_tokens = self.to_patch_x(x_ct)                  # (B, N, dim)
+        k_tokens = self.to_patch_cond(x_k)               # (B, N, dim)
+        v_tokens = self.to_patch_cond(x_main)             # (B, N, dim)
+
+        q_tokens = self.dropout(q_tokens + self.pos_x)
+        k_tokens = self.dropout(k_tokens + self.pos_cond)
+        v_tokens = self.dropout(v_tokens + self.pos_cond)
+
+        attn_out = self.cross_attn(q_tokens, k_tokens, v_tokens) + q_tokens
+        out_tokens = self.ff(attn_out) + attn_out
+
+        out_tokens = self.return_linear(out_tokens)
+        out = self.reshape_back(out_tokens)
+        return out
