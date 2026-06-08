@@ -214,3 +214,17 @@ class FlowMatchingV14(nn.Module):
             x = x + v * dt
 
         return x
+
+
+# ----------------------------- v1.5: Risk-aware CT + SYN + DIS + Penalty -----------------------------
+class FlowMatchingV15(FlowMatchingV14):
+    """FlowMatching wrapper for v1.5 — Risk-aware ControlNet-lite Penalty
+    Adapter.
+
+    The flow-matching objective, the spatially-weighted MSE loss and the
+    Euler sampler are *identical* to v1.4: the v1.5 risk-aware local
+    modulation lives entirely inside the network's forward pass, so the
+    ``(x_t, t, ct, syn, dis, penalty)`` interface is unchanged. This thin
+    subclass exists only for naming clarity.
+    """
+    pass
