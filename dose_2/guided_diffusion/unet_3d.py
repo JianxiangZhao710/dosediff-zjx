@@ -1,0 +1,426 @@
+from abc import abstractmethod
+
+import math
+
+import numpy as np
+import torch
+import torch as th
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .nn import (
+    checkpoint,
+    conv_nd,
+    linear,
+    avg_pool_nd,
+    zero_module,
+    normalization,
+    timestep_embedding,
+)
+
+from .vit import ViT_fusion_3D
+
+class TimestepBlock(nn.Module):
+    @abstractmethod
+    def forward(self, x, emb):
+        """
+        Apply the module to `x` given `emb` timestep embeddings.
+        """
+
+class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
+    def forward(self, x, emb):
+        for layer in self:
+            if isinstance(layer, TimestepBlock):
+                x = layer(x, emb)
+            else:
+                x = layer(x)
+        return x
+
+class Upsample(nn.Module):
+    def __init__(self, channels, use_conv, dims=3, out_channels=None):
+        super().__init__()
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.dims = dims
+        if use_conv:
+            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=1)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        if self.dims == 3:
+            # 3D Upsample: use trilinear for better quality in 3D, or nearest
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
+        else:
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
+        
+        if self.use_conv:
+            x = self.conv(x)
+        return x
+
+class Downsample(nn.Module):
+    def __init__(self, channels, use_conv, dims=3, out_channels=None):
+        super().__init__()
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.dims = dims
+        stride = 2
+        if use_conv:
+            self.op = conv_nd(
+                dims, self.channels, self.out_channels, 3, stride=stride, padding=1
+            )
+        else:
+            assert self.channels == self.out_channels
+            self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        return self.op(x)
+
+class ResBlock(TimestepBlock):
+    def __init__(
+        self,
+        channels,
+        emb_channels,
+        dropout,
+        out_channels=None,
+        use_conv=False,
+        use_scale_shift_norm=False,
+        dims=3,
+        use_checkpoint=False,
+        up=False,
+        down=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_checkpoint = use_checkpoint
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.updown = up or down
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(dims, channels, self.out_channels, 3, padding=1),
+        )
+
+        if up:
+            self.h_upd = Upsample(channels, False, dims)
+            self.x_upd = Upsample(channels, False, dims)
+        elif down:
+            self.h_upd = Downsample(channels, False, dims)
+            self.x_upd = Downsample(channels, False, dims)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(
+                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+            ),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = conv_nd(
+                dims, channels, self.out_channels, 3, padding=1
+            )
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x, emb):
+        return checkpoint(
+            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        )
+
+    def _forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
+
+class AttentionBlock(nn.Module):
+    # 3D Attention
+    def __init__(self, channels, num_heads=1, num_head_channels=-1, use_checkpoint=False, use_new_attention_order=False):
+        super().__init__()
+        self.channels = channels
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            self.num_heads = channels // num_head_channels
+        self.use_checkpoint = use_checkpoint
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1) # 1x1x1 conv
+        self.attention = QKVAttention(self.num_heads)
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x):
+        return checkpoint(self._forward, (x,), self.parameters(), True)
+
+    def _forward(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
+
+class QKVAttention(nn.Module):
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv):
+        bs, width, length = qkv.shape
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.chunk(3, dim=1)
+        if ch <= 0:
+            print(f"DEBUG QKVAttention: qkv.shape={qkv.shape}, n_heads={self.n_heads}, ch={ch}")
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = th.einsum(
+            "bct,bcs->bts",
+            (q * scale).view(bs * self.n_heads, ch, length),
+            (k * scale).view(bs * self.n_heads, ch, length),
+        )
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        return a.reshape(bs, -1, length)
+
+class UNetModel_MS_Former_3D(nn.Module):
+    def __init__(
+        self,
+        image_size, # (D, H, W) or int
+        in_channels,
+        ct_channels,
+        syn_channels=1,
+        dis_channels=11,
+        model_channels=64,
+        out_channels=1,
+        num_res_blocks=2,
+        attention_resolutions=(8, 16),
+        dropout=0,
+        channel_mult=(1, 2, 4, 8),
+        conv_resample=True,
+        dims=3, # Default 3
+        num_classes=None,
+        use_checkpoint=False,
+        use_fp16=False,
+        num_heads=1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=False,
+        resblock_updown=False,
+        use_new_attention_order=False,
+    ):
+        super().__init__()
+        
+        if num_heads_upsample == -1:
+            num_heads_upsample = num_heads
+
+        self.dims = dims
+        self.image_size = image_size
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.attention_resolutions = attention_resolutions
+        self.dropout = dropout
+        self.channel_mult = channel_mult
+        self.conv_resample = conv_resample
+        self.num_classes = num_classes
+        self.use_checkpoint = use_checkpoint
+        self.dtype = th.float16 if use_fp16 else th.float32
+        self.num_heads = num_heads
+        self.num_head_channels = num_head_channels
+        self.num_heads_upsample = num_heads_upsample
+
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            linear(time_embed_dim, time_embed_dim),
+        )
+
+        ch = input_ch = int(channel_mult[0] * model_channels)
+        
+        # --- Multi-Stream Input Blocks ---
+        self.input_blocks = nn.ModuleList([
+            TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))
+        ])
+        self.input_blocks_CT = nn.ModuleList([
+            TimestepEmbedSequential(conv_nd(dims, ct_channels, ch, 3, padding=1))
+        ])
+        self.input_blocks_SYN = nn.ModuleList([
+            TimestepEmbedSequential(conv_nd(dims, syn_channels, ch, 3, padding=1))
+        ])
+        self.input_blocks_DIS = nn.ModuleList([
+            TimestepEmbedSequential(conv_nd(dims, dis_channels, ch, 3, padding=1))
+        ])
+        
+        self._feature_size = ch
+        input_block_chans = [ch]
+        ds = 1
+
+        for level, mult in enumerate(channel_mult):
+            for _ in range(num_res_blocks):
+                layers = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
+                layers_CT = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
+                layers_SYN = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
+                layers_DIS = [ResBlock(ch, time_embed_dim, dropout, out_channels=int(mult * model_channels), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)]
+                
+                ch = int(mult * model_channels)
+                
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
+                    layers_CT.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
+                    layers_SYN.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
+                    layers_DIS.append(AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels))
+                
+                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                self.input_blocks_CT.append(TimestepEmbedSequential(*layers_CT))
+                self.input_blocks_SYN.append(TimestepEmbedSequential(*layers_SYN))
+                self.input_blocks_DIS.append(TimestepEmbedSequential(*layers_DIS))
+                
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            
+            if level != len(channel_mult) - 1:
+                out_ch = ch
+                # Downsample
+                layers = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
+                layers_CT = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
+                layers_SYN = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
+                layers_DIS = [ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, down=True) if resblock_updown else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)]
+                
+                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                self.input_blocks_CT.append(TimestepEmbedSequential(*layers_CT))
+                self.input_blocks_SYN.append(TimestepEmbedSequential(*layers_SYN))
+                self.input_blocks_DIS.append(TimestepEmbedSequential(*layers_DIS))
+                
+                ch = out_ch
+                input_block_chans.append(ch)
+                ds *= 2
+                self._feature_size += ch
+
+        # Middle Block
+        
+        # --- ViT Fusion Initialization ---
+        ds_factor = 2 ** (len(channel_mult) - 1)
+        if isinstance(image_size, int):
+             feature_size = (image_size // ds_factor, image_size // ds_factor, image_size // ds_factor)
+        else:
+             feature_size = tuple([s // ds_factor for s in image_size])
+             
+        self.fusion = ViT_fusion_3D(
+            image_size=feature_size,
+            patch_size=(2, 2, 2), # Small patch size for fine-grained fusion on bottleneck
+            dim=1024, # Transformer hidden dim (reduced to fit GPU if needed, originally 1024)
+            heads=4,
+            mlp_dim=2048,
+            channels=ch, # Current channel count
+            dim_head=64
+        )
+        
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(ch, time_embed_dim, dropout, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm),
+            AttentionBlock(ch, num_heads=num_heads, num_head_channels=num_head_channels),
+            ResBlock(ch, time_embed_dim, dropout, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm),
+        )
+        self._feature_size += ch
+
+        # Output Blocks
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(channel_mult))[::-1]:
+            for i in range(num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                layers = [
+                    ResBlock(ch + ich, time_embed_dim, dropout, out_channels=int(model_channels * mult), dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm)
+                ]
+                ch = int(model_channels * mult)
+                if ds in attention_resolutions:
+                    layers.append(AttentionBlock(ch, num_heads=num_heads_upsample, num_head_channels=num_head_channels))
+                
+                if level and i == num_res_blocks:
+                    out_ch = ch
+                    layers.append(ResBlock(ch, time_embed_dim, dropout, out_channels=out_ch, dims=dims, use_checkpoint=use_checkpoint, use_scale_shift_norm=use_scale_shift_norm, up=True) if resblock_updown else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch))
+                    ds //= 2
+                self.output_blocks.append(TimestepEmbedSequential(*layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            normalization(ch),
+            nn.SiLU(),
+            zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
+        )
+
+    def forward(self, x, timesteps, ct, syn, dis, y=None):
+        hs = []
+        # timestep_embedding 默认是 float32；如果开启 use_fp16，则 time_embed 权重是 fp16，
+        # 需要保证输入 dtype 一致，避免 Float/Half 不匹配。
+        emb_in = timestep_embedding(timesteps, self.model_channels).type(self.dtype)
+        emb = self.time_embed(emb_in)
+
+        h = x.type(self.dtype)
+        h_ct = ct.type(self.dtype)
+        h_syn = syn.type(self.dtype)
+        h_dis = dis.type(self.dtype)
+        
+        last_ct_feat = None
+        last_syn_feat = None
+        last_dis_feat = None
+        
+        # Multi-Stream Encoder
+        for i, module in enumerate(self.input_blocks):
+            h_ct = self.input_blocks_CT[i](h_ct, emb)
+            h_syn = self.input_blocks_SYN[i](h_syn, emb)
+            h_dis = self.input_blocks_DIS[i](h_dis, emb)
+            h = module(h, emb) + h_ct + h_syn + h_dis
+            hs.append(h)
+            
+            # Keep track of last features for Bottleneck Fusion
+            last_ct_feat = h_ct
+            last_syn_feat = h_syn
+            last_dis_feat = h_dis
+        
+        # --- ViT Fusion at Bottleneck ---
+        h = self.fusion.forward_4(last_ct_feat, last_syn_feat, last_dis_feat, h) + h
+        
+        # Middle
+        h = self.middle_block(h, emb)
+        
+        # Decoder
+        for module in self.output_blocks:
+            h = th.cat([h, hs.pop()], dim=1)
+            h = module(h, emb)
+            
+        return self.out(h)
