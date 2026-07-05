@@ -73,6 +73,9 @@ class FlowMatchingV20(FlowMatchingV14):
         router_smooth_weight=0.0,
         hf_kernel=5,
         morphology_risk_weighted=True,
+        lambda_global_l1=0.0,
+        global_l1_use_body_mask=True,
+        body_ct_threshold=-0.999,
     ):
         super().__init__(net, sigma_min)
         self.lambda_grad_loss = float(lambda_grad_loss)
@@ -81,6 +84,13 @@ class FlowMatchingV20(FlowMatchingV14):
         self.router_smooth_weight = float(router_smooth_weight)
         self.hf_kernel = int(hf_kernel)
         self.morphology_risk_weighted = bool(morphology_risk_weighted)
+        # Additive global (body) L1 on the estimated clean dose. Targets the
+        # many low-weight background / falloff voxels that the structure-
+        # weighted MSE under-fits, improving voxel-wise Dose Score while
+        # leaving the structure-region (DVH) fit of the base loss intact.
+        self.lambda_global_l1 = float(lambda_global_l1)
+        self.global_l1_use_body_mask = bool(global_l1_use_body_mask)
+        self.body_ct_threshold = float(body_ct_threshold)
         self.last_components = {}
 
     def _raw_net(self):
@@ -150,9 +160,27 @@ class FlowMatchingV20(FlowMatchingV14):
             total = total + self.router_smooth_weight * tv
             comps["router_tv"] = tv.detach()
 
+        # ---- Estimated clean dose (shared by global-L1 + morphology) ----
+        need_clean = (
+            self.lambda_global_l1 > 0.0
+            or self.lambda_grad_loss > 0.0
+            or self.lambda_hf_loss > 0.0
+        )
+        pred_clean = x_t + (1.0 - t_expand) * pred_v if need_clean else None
+
+        # ---- Additive global (body) L1: improves voxel-wise Dose Score ----
+        if self.lambda_global_l1 > 0.0:
+            if self.global_l1_use_body_mask:
+                body = (ct > self.body_ct_threshold).to(pred_clean.dtype)
+            else:
+                body = torch.ones_like(x_1)
+            l1 = (pred_clean - x_1).abs()
+            g_l1 = (l1 * body).sum() / (body.sum() + 1e-8)
+            total = total + self.lambda_global_l1 * g_l1
+            comps["global_l1"] = g_l1.detach()
+
         # ---- Optional morphology loss (estimated clean dose) ----
         if self.lambda_grad_loss > 0.0 or self.lambda_hf_loss > 0.0:
-            pred_clean = x_t + (1.0 - t_expand) * pred_v
             risk_map = getattr(raw, "_last_m_risk", None)
             if risk_map is not None:
                 risk_map = risk_map.to(device).float()
